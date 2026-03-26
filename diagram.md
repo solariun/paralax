@@ -170,7 +170,7 @@ flowchart TD
         D --> E["state = READY\nnext_run = now"]
         E --> F["_init_target = t"]
         F --> G["setjmp(sched_ret)"]
-        G --> H["Compute top = stack + STACK_SIZE\nAlign to 16 bytes: top = (top-16) & ~0xF"]
+        G --> H["Compute top = _stack_ptr + _stack_size\nAlign to 16 bytes: top = (top-16) & ~0xF"]
         H --> I["set_sp(top)\nSwitch to thread stack"]
         I --> J["bootstrap()"]
         J --> K["setjmp(t->ctx)\nSave thread context"]
@@ -193,8 +193,14 @@ flowchart TD
         U --> V["setjmp(next->caller)"]
         V --> W["next->state = RUNNING\nlongjmp(next->ctx)"]
         W --> X["--- Thread executes ---\ncalls yield() or wait()\nor run() returns"]
-        X --> Y["Back in scheduler\nset state = YIELDED if still RUNNING"]
-        Y --> Z["next_run = now + nice"]
+        X --> GZ{"Guard zone check:\n_stack_ptr[0..15]\nstill 0xCC?"}
+        GZ -- "No: corrupted" --> OVF["on_stack_overflow()\nstate = FINISHED\n(thread killed)"]
+        OVF --> N
+        GZ -- "Yes: intact" --> Y{"Did run() return?"}
+        Y -- "Yes" --> FIN["finishing() callback\nstate = FINISHED"]
+        FIN --> N
+        Y -- "No (yield/wait)" --> YS["set state = YIELDED\nif still RUNNING"]
+        YS --> Z["next_run = now + nice"]
         Z --> N
     end
 ```
@@ -236,50 +242,96 @@ sequenceDiagram
 
 ## 5. Memory Layout
 
+### 5a. Internal Stack (default constructor)
+
 ```mermaid
 block-beta
     columns 1
 
     block:threadobj["Thread Object (sizeof(Thread))"]
-        columns 4
+        columns 5
         vtable["vtable ptr"]:1
         linkable["Linkable fields\n(next, prev, container)"]:1
         jmpbufs["jmp_buf ctx\njmp_buf caller"]:1
         statefields["state | priority\nnice | next_run\nwait_key | wait_param\nwait_value"]:1
+        stackmeta["_stack_ptr\n_stack_size\n(point to _stack_buf)"]:1
     end
 
     space
 
-    block:stackbuf["uint8_t stack[PARALAX_STACK_SIZE]"]
+    block:stackbuf["uint8_t _stack_buf[PARALAX_STACK_SIZE] (embedded in Thread)"]
         columns 8
-        low["stack[0]\n(low addr)\n0xCC watermark\nuntouched"]:2
-        mid["...\nwatermark\nboundary\n(stack_used)"]:2
+        guard["stack[0..15]\nGUARD ZONE\n(16 bytes)"]:2
+        low["stack[16..]\n0xCC watermark\nuntouched"]:2
         used["...\nused by\nthread\nexecution"]:2
         high["stack[N-1]\n(high addr)\nset_sp points\nhere - 16"]:2
     end
 
     threadobj --> stackbuf
 
+    style guard fill:#d4a,color:#fff
     style low fill:#4a9,color:#fff
-    style mid fill:#ea4,color:#fff
     style used fill:#e55,color:#fff
     style high fill:#47c,color:#fff
 ```
 
+### 5b. External Stack (external-stack constructor)
+
+```mermaid
+block-beta
+    columns 1
+
+    block:threadobj2["Thread Object (sizeof(Thread))"]
+        columns 5
+        vtable2["vtable ptr"]:1
+        linkable2["Linkable fields\n(next, prev, container)"]:1
+        jmpbufs2["jmp_buf ctx\njmp_buf caller"]:1
+        statefields2["state | priority\nnice | next_run\nwait_key | wait_param\nwait_value"]:1
+        stackmeta2["_stack_ptr\n_stack_size\n(point to ext_stack)"]:1
+    end
+
+    space
+
+    block:internalunused["uint8_t _stack_buf[STACK_SIZE] (embedded, UNUSED)"]
+        columns 1
+        unused["not used -- ignored when external stack is provided"]
+    end
+
+    space
+
+    block:extstackbuf["uint8_t *ext_stack (heap / custom memory, size = ext_size)"]
+        columns 8
+        extguard["ext[0..15]\nGUARD ZONE\n(16 bytes)"]:2
+        extlow["ext[16..]\n0xCC watermark\nuntouched"]:2
+        extused["...\nused by\nthread\nexecution"]:2
+        exthigh["ext[N-1]\n(high addr)\nset_sp points\nhere - 16"]:2
+    end
+
+    threadobj2 --> extstackbuf
+
+    style unused fill:#888,color:#fff
+    style extguard fill:#d4a,color:#fff
+    style extlow fill:#4a9,color:#fff
+    style extused fill:#e55,color:#fff
+    style exthigh fill:#47c,color:#fff
+```
+
 **Stack layout details:**
 
-- The stack buffer `stack[STACK_SIZE]` is embedded at the end of the Thread object.
-- `set_sp()` points the hardware stack pointer to `(stack + STACK_SIZE - 16) & ~0xF` (16-byte aligned, with 16 bytes of headroom).
+- **Internal stack (default):** The buffer `_stack_buf[STACK_SIZE]` is embedded inside the Thread object. The internal pointers `_stack_ptr` and `_stack_size` point to `_stack_buf` and `STACK_SIZE` respectively.
+- **External stack:** When constructed with `Thread(list, nice, priority, ext_stack, ext_size)`, `_stack_ptr` and `_stack_size` point to the caller-supplied buffer. The embedded `_stack_buf` is ignored.
+- `set_sp()` points the hardware stack pointer to `(_stack_ptr + _stack_size - 16) & ~0xF` (16-byte aligned, with 16 bytes of headroom).
 - The stack **grows downward** from high addresses toward low addresses.
-- `stack_paint()` fills the entire buffer with `0xCC` before first use.
-- `stack_used()` scans from `stack[0]` upward, counting intact `0xCC` bytes. The first non-`0xCC` byte marks the high-water boundary. `stack_used = STACK_SIZE - clean_bytes`.
+- `stack_paint()` fills the active buffer (internal or external) with `0xCC` before first use.
+- **Guard zone:** The bottom 16 bytes (`_stack_ptr[0..15]`) serve as a guard zone. If these bytes are overwritten (no longer `0xCC`), the scheduler detects a stack overflow and calls `on_stack_overflow()`, then forcibly kills the thread.
+- `stack_used()` scans from `_stack_ptr[0]` upward, counting intact `0xCC` bytes. The first non-`0xCC` byte marks the high-water boundary. `stack_used = _stack_size - clean_bytes`.
 - `stack_free() = stack_max() - stack_used()`.
 
 ```
-Address:  low ──────────────────────────────────────────── high
+Address:  low ──────────────────────────────────────────────────── high
 
-          [ 0xCC 0xCC 0xCC ... | used frames ... | ← SP ]
-          ↑                     ↑                   ↑
-          stack[0]              watermark boundary   set_sp target
-          (untouched)           (stack_used)         (top - 16, aligned)
+          [ GUARD 16B | 0xCC 0xCC ... | used frames ... | ← SP ]
+          ↑            ↑               ↑                   ↑
+          _stack_ptr   guard end       watermark boundary   set_sp target
+          [0]          [16]            (stack_used)         (top - 16, aligned)
 ```
