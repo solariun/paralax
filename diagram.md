@@ -38,11 +38,11 @@ classDiagram
         -const void *_wait_key
         -size_t _wait_param
         -size_t _wait_value
-        -uint8_t _stack_buf[STACK_SIZE]
         -uint8_t *_stack_ptr
         -size_t _stack_size
-        +Thread(LinkList*, size_t nice, uint8_t priority)
-        +Thread(LinkList*, size_t nice, uint8_t priority, uint8_t *ext_stack, size_t ext_size)
+        -bool _owns_stack
+        +Thread(LinkList*, size_t stack_size, size_t nice, uint8_t priority)
+        +Thread(LinkList*, uint8_t *ext_stack, size_t ext_size, size_t nice, uint8_t priority)
         +run()* void
         +yield() void
         +finishing() void
@@ -242,32 +242,32 @@ sequenceDiagram
 
 ## 5. Memory Layout
 
-### 5a. Internal Stack (default constructor)
+### 5a. Framework-Allocated Stack (default constructor)
 
 ```mermaid
 block-beta
     columns 1
 
-    block:threadobj["Thread Object (sizeof(Thread))"]
+    block:threadobj["Thread Object (sizeof(Thread)) -- no embedded buffer"]
         columns 5
         vtable["vtable ptr"]:1
         linkable["Linkable fields\n(next, prev, container)"]:1
         jmpbufs["jmp_buf ctx\njmp_buf caller"]:1
         statefields["state | priority\nnice | next_run\nwait_key | wait_param\nwait_value"]:1
-        stackmeta["_stack_ptr\n_stack_size\n(point to _stack_buf)"]:1
+        stackmeta["_stack_ptr\n_stack_size\n_owns_stack = true"]:1
     end
 
     space
 
-    block:stackbuf["uint8_t _stack_buf[PARALAX_STACK_SIZE] (embedded in Thread)"]
+    block:heapbuf["Heap buffer: new uint8_t[stack_size] (freed on destruction)"]
         columns 8
-        guard["stack[0..15]\nGUARD ZONE\n(16 bytes)"]:2
-        low["stack[16..]\n0xCC watermark\nuntouched"]:2
+        guard["buf[0..15]\nGUARD ZONE\n(16 bytes)"]:2
+        low["buf[16..]\n0xCC watermark\nuntouched"]:2
         used["...\nused by\nthread\nexecution"]:2
-        high["stack[N-1]\n(high addr)\nset_sp points\nhere - 16"]:2
+        high["buf[N-1]\n(high addr)\nset_sp points\nhere - 16"]:2
     end
 
-    threadobj --> stackbuf
+    threadobj --> heapbuf
 
     style guard fill:#d4a,color:#fff
     style low fill:#4a9,color:#fff
@@ -275,31 +275,24 @@ block-beta
     style high fill:#47c,color:#fff
 ```
 
-### 5b. External Stack (external-stack constructor)
+### 5b. User-Provided Stack (external-stack constructor)
 
 ```mermaid
 block-beta
     columns 1
 
-    block:threadobj2["Thread Object (sizeof(Thread))"]
+    block:threadobj2["Thread Object (sizeof(Thread)) -- no embedded buffer"]
         columns 5
         vtable2["vtable ptr"]:1
         linkable2["Linkable fields\n(next, prev, container)"]:1
         jmpbufs2["jmp_buf ctx\njmp_buf caller"]:1
         statefields2["state | priority\nnice | next_run\nwait_key | wait_param\nwait_value"]:1
-        stackmeta2["_stack_ptr\n_stack_size\n(point to ext_stack)"]:1
+        stackmeta2["_stack_ptr\n_stack_size\n_owns_stack = false"]:1
     end
 
     space
 
-    block:internalunused["uint8_t _stack_buf[STACK_SIZE] (embedded, UNUSED)"]
-        columns 1
-        unused["not used -- ignored when external stack is provided"]
-    end
-
-    space
-
-    block:extstackbuf["uint8_t *ext_stack (heap / custom memory, size = ext_size)"]
+    block:extstackbuf["uint8_t *ext_stack (static array / custom memory, size = ext_size, never freed)"]
         columns 8
         extguard["ext[0..15]\nGUARD ZONE\n(16 bytes)"]:2
         extlow["ext[16..]\n0xCC watermark\nuntouched"]:2
@@ -309,7 +302,6 @@ block-beta
 
     threadobj2 --> extstackbuf
 
-    style unused fill:#888,color:#fff
     style extguard fill:#d4a,color:#fff
     style extlow fill:#4a9,color:#fff
     style extused fill:#e55,color:#fff
@@ -318,11 +310,12 @@ block-beta
 
 **Stack layout details:**
 
-- **Internal stack (default):** The buffer `_stack_buf[STACK_SIZE]` is embedded inside the Thread object. The internal pointers `_stack_ptr` and `_stack_size` point to `_stack_buf` and `STACK_SIZE` respectively.
-- **External stack:** When constructed with `Thread(list, nice, priority, ext_stack, ext_size)`, `_stack_ptr` and `_stack_size` point to the caller-supplied buffer. The embedded `_stack_buf` is ignored.
+- **Framework-allocated (default):** The constructor allocates `new uint8_t[stack_size]`. `_stack_ptr` points to the heap buffer, `_stack_size` holds the size, and `_owns_stack = true` so the destructor calls `delete[]`.
+- **User-provided:** When constructed with `Thread(list, ext_stack, ext_size, nice, priority)`, `_stack_ptr` and `_stack_size` point to the caller-supplied buffer. `_owns_stack = false`, so the destructor never frees the buffer.
+- There is **no embedded `_stack_buf[]` array** inside the Thread object. The Thread only stores a pointer, a size, and the ownership flag.
 - `set_sp()` points the hardware stack pointer to `(_stack_ptr + _stack_size - 16) & ~0xF` (16-byte aligned, with 16 bytes of headroom).
 - The stack **grows downward** from high addresses toward low addresses.
-- `stack_paint()` fills the active buffer (internal or external) with `0xCC` before first use.
+- `stack_paint()` fills the stack buffer (heap or external) with `0xCC` before first use.
 - **Guard zone:** The bottom 16 bytes (`_stack_ptr[0..15]`) serve as a guard zone. If these bytes are overwritten (no longer `0xCC`), the scheduler detects a stack overflow and calls `on_stack_overflow()`, then forcibly kills the thread.
 - `stack_used()` scans from `_stack_ptr[0]` upward, counting intact `0xCC` bytes. The first non-`0xCC` byte marks the high-water boundary. `stack_used = _stack_size - clean_bytes`.
 - `stack_free() = stack_max() - stack_used()`.

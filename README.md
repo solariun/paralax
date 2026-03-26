@@ -9,7 +9,7 @@ Paralax provides cooperative (non-preemptive) multithreading using only standard
 C++ and a single inline assembly instruction per architecture.  Key properties:
 
 - **No OS required** -- runs on bare-metal microcontrollers with no operating system.
-- **No heap allocation by default** -- all stacks are embedded inside the Thread object as fixed-size arrays, with optional support for external (heap or custom memory) stack buffers.
+- **Flexible stack allocation** -- by default, stacks are heap-allocated (`new uint8_t[stack_size]`) and freed on destruction. For no-heap targets (e.g., AVR), a user-provided external buffer constructor avoids all dynamic allocation.
 - **No external dependencies** -- only `<setjmp.h>`, `<stdint.h>`, and `<stddef.h>`.
 - **One inline ASM instruction per architecture** -- `set_sp()` writes the stack pointer register; everything else is portable C++ (`setjmp`/`longjmp`).
 - **Time-based scheduling** with configurable `nice` (minimum interval) and `priority` (tiebreaker).
@@ -56,7 +56,7 @@ struct Blinker : Thread {
     int reps;
 
     Blinker(const char *n, int r, LinkList *list, size_t nice)
-        : Thread(list, nice), name(n), reps(r) {}
+        : Thread(list, PARALAX_STACK_SIZE, nice), name(n), reps(r) {}
 
     void run() override {
         for (int i = 0; i < reps; i++) {
@@ -136,9 +136,10 @@ The time unit here is FreeRTOS ticks. Set `nice` values in ticks accordingly
 class Thread : public Linkable {
 public:
     // Construction
-    Thread(LinkList *list = nullptr, size_t nice = 0, uint8_t priority = 128);
-    Thread(LinkList *list, size_t nice, uint8_t priority,
-           uint8_t *ext_stack, size_t ext_size);
+    Thread(LinkList *list = nullptr, size_t stack_size = PARALAX_STACK_SIZE,
+           size_t nice = 0, uint8_t priority = 128);
+    Thread(LinkList *list, uint8_t *ext_stack, size_t ext_size,
+           size_t nice = 0, uint8_t priority = 128);
 
     // States
     enum State : uint8_t {
@@ -153,7 +154,7 @@ public:
     size_t      next_run()   const;  // next scheduled activation time
     bool        finished()   const;  // true if run() returned
     const void *id()         const;  // opaque object address
-    size_t      stack_max()  const;  // active stack size (internal or external)
+    size_t      stack_max()  const;  // stack buffer size (heap-allocated or user-provided)
     size_t      stack_used() const;  // high-water mark bytes used
     size_t      stack_free() const;  // stack_max() - stack_used()
 
@@ -177,19 +178,22 @@ public:
 };
 ```
 
-**Constructor parameters (default -- internal stack):**
+**Constructor parameters (framework-allocated stack -- default):**
 - `list` -- Thread pool to join. Pass `nullptr` and insert manually later.
+- `stack_size` -- Stack buffer size in bytes. Allocated via `new uint8_t[stack_size]` and freed automatically on destruction. Default `PARALAX_STACK_SIZE`.
 - `nice` -- Minimum time units between activations. `0` means run as fast as possible.
 - `priority` -- Lower value = scheduled first when other criteria are equal. Default `128`.
 
-**Constructor parameters (external stack):**
-- `list`, `nice`, `priority` -- Same as above.
-- `ext_stack` -- Pointer to a caller-supplied stack buffer (heap-allocated or from custom memory).
+**Constructor parameters (user-provided stack):**
+- `list` -- Same as above.
+- `ext_stack` -- Pointer to a caller-supplied stack buffer (static array, heap-allocated, or from custom memory).
 - `ext_size` -- Size in bytes of the external stack buffer.
+- `nice`, `priority` -- Same as above.
 
-When the external-stack constructor is used, the built-in `_stack_buf[STACK_SIZE]` is
-ignored and the thread operates entirely on the provided buffer. The caller is responsible
-for the lifetime of the external buffer (it must outlive the thread).
+When the user-provided constructor is used, the thread operates on the supplied buffer
+and **never frees it**. The caller is responsible for the lifetime of the buffer (it must
+outlive the thread). This constructor avoids all heap allocation, making it ideal for
+RAM-constrained targets like AVR.
 
 **`finishing()`** -- Virtual callback invoked after `run()` returns but before
 the thread enters `FINISHED` state. Override to perform cleanup, logging, or
@@ -494,50 +498,60 @@ interactions so that at least one thread can always make progress.
 
 ## Stack Configuration
 
-Each `Thread` object embeds a `uint8_t _stack_buf[PARALAX_STACK_SIZE]` array that
-is used by default. Internally, `_stack_ptr` and `_stack_size` track the active
-buffer -- they point to `_stack_buf` for the default constructor, or to the
-caller-supplied buffer when the external-stack constructor is used.
+The `Thread` class no longer embeds a fixed-size stack array. Instead, each thread
+holds a `uint8_t *_stack_ptr`, a `size_t _stack_size`, and a `bool _owns_stack`
+flag that determines whether the buffer is freed on destruction.
 
-Override the default built-in stack size before including the header:
+Two modes are available:
+
+### Mode 1: Framework-Allocated (default)
+
+The default constructor allocates the stack via `new uint8_t[stack_size]` and
+frees it in the destructor (`_owns_stack = true`).
 
 ```cpp
-#define PARALAX_STACK_SIZE 256
+// Uses default PARALAX_STACK_SIZE (heap-allocated)
+MyThread t(&threads, PARALAX_STACK_SIZE, 100, 128);
+
+// Or rely on the default:
+MyThread t(&threads);
+```
+
+Override the default stack size at compile time before including the header:
+
+```cpp
+#define PARALAX_STACK_SIZE 2048
 #include "paralax.hpp"
+```
+
+### Mode 2: User-Provided (no heap)
+
+The external-stack constructor uses a caller-supplied buffer and **never frees it**
+(`_owns_stack = false`). This avoids all heap allocation, ideal for
+RAM-constrained targets like AVR.
+
+```cpp
+static uint8_t my_stack[256];
+MyThread t(&threads, my_stack, sizeof(my_stack), 500, 100);
+```
+
+Or with a heap-allocated buffer whose lifetime you manage yourself:
+
+```cpp
+uint8_t *heap_stack = new uint8_t[4096];
+MyThread t(&threads, heap_stack, 4096, 100, 128);
+// ... after thread finishes:
+delete[] heap_stack;
 ```
 
 ### Recommended Sizes by Platform
 
-| Platform | Recommended `PARALAX_STACK_SIZE` | Notes |
+| Platform | Recommended stack size | Notes |
 |---|---|---|
-| **AVR** (Uno, Mega, Nano) | 128 -- 256 | Total SRAM is 2 KB (Uno) to 8 KB (Mega). Each thread costs `sizeof(Thread)` + stack. |
+| **AVR** (Uno, Mega, Nano) | 128 -- 256 | Total SRAM is 2 KB (Uno) to 8 KB (Mega). Use the user-provided constructor with static buffers to avoid heap. |
 | **ESP8266** | 1024 -- 2048 | 80 KB DRAM. WDT requires periodic `yield()` (see platform notes). |
 | **Pi Pico / ESP32** | 4096 -- 8192 | 264 KB (Pico) or 520 KB (ESP32) SRAM. Generous but not infinite. |
 | **Desktop** (x86-64, AArch64) | 8192+ | Default is 8192. Increase for deep call stacks or large locals. |
-
-### External / Heap Stacks
-
-If the built-in stack is too small (or you want per-thread sizing without
-recompiling), use the external-stack constructor to supply a heap-allocated or
-custom-memory buffer:
-
-```cpp
-uint8_t *heap_stack = new uint8_t[4096];
-MyThread t(&threads, 100, 128, heap_stack, 4096);
-```
-
-The thread will use `heap_stack` instead of its internal `_stack_buf[]`. Stack
-watermarking, `stack_used()`, `stack_free()`, and the guard-zone overflow check
-all work identically on external buffers. The caller owns the buffer and must
-ensure it remains valid for the lifetime of the thread (free it after the thread
-is `FINISHED`).
-
-You can also use statically allocated memory:
-
-```cpp
-static uint8_t big_stack[16384];
-MyThread t(&threads, 50, 128, big_stack, sizeof(big_stack));
-```
 
 ### Stack Watermarking
 
@@ -570,8 +584,9 @@ timing, or `millis()` / `delay()` for millisecond timing.
 ### AVR (Arduino Uno / Mega / Nano)
 
 - Total SRAM: 2 KB (Uno/Nano), 8 KB (Mega).  Each thread consumes
-  `sizeof(Thread)` + `PARALAX_STACK_SIZE` bytes.  Two threads with 256-byte
-  stacks require approximately 600+ bytes total.
+  `sizeof(Thread)` plus the stack buffer.  Use the user-provided constructor
+  with static buffers to avoid heap allocation.  Two threads with 128-byte
+  stacks require approximately 400+ bytes total.
 - The AVR `set_sp()` uses two 8-bit `out` instructions (`SP_H`, `SP_L`).
   Interrupts should be disabled during `schedule()` if ISRs touch the stack
   (cooperative threads typically do not need ISRs).
@@ -608,8 +623,8 @@ size_t paralax_getTime()            { return millis(); }
 void   paralax_sleepTime(size_t ms) { delay(ms); }
 ```
 
-Set `PARALAX_STACK_SIZE` before the `#include` if the default (8192) is too
-large for your board.
+Set `PARALAX_STACK_SIZE` before the `#include` to change the default stack
+size, or pass a custom size to each thread's constructor.
 
 ### PlatformIO / CMake
 

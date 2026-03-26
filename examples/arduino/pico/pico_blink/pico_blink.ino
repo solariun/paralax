@@ -49,7 +49,7 @@ static Mailbox  mailbox;
  * ------------------------------------------------------------------ */
 struct BlinkThread : public Thread {
     BlinkThread(LinkList *list)
-        : Thread(list, 500, 100) {}
+        : Thread(list, PARALAX_STACK_SIZE, 500, 100) {}
 
     void run() override {
         pinMode(LED_BUILTIN, OUTPUT);
@@ -67,7 +67,7 @@ struct BlinkThread : public Thread {
  * ------------------------------------------------------------------ */
 struct CounterThread : public Thread {
     CounterThread(LinkList *list)
-        : Thread(list, 1000, 120) {}
+        : Thread(list, PARALAX_STACK_SIZE, 1000, 120) {}
 
     void run() override {
         unsigned long count = 0;
@@ -85,7 +85,7 @@ struct CounterThread : public Thread {
  * ------------------------------------------------------------------ */
 struct ProducerThread : public Thread {
     ProducerThread(LinkList *list)
-        : Thread(list, 500, 130) {}
+        : Thread(list, PARALAX_STACK_SIZE, 500, 130) {}
 
     void run() override {
         size_t value = 0;
@@ -104,7 +104,7 @@ struct ProducerThread : public Thread {
  * ------------------------------------------------------------------ */
 struct ConsumerThread : public Thread {
     ConsumerThread(LinkList *list)
-        : Thread(list, 0, 130) {}
+        : Thread(list, PARALAX_STACK_SIZE, 0, 130) {}
 
     void run() override {
         while (true) {
@@ -117,7 +117,7 @@ struct ConsumerThread : public Thread {
 };
 
 /* ------------------------------------------------------------------
- * Instances (file-scope, allocated in .bss — no heap)
+ * Instances (file-scope; stacks are heap-allocated by the framework)
  * ------------------------------------------------------------------ */
 static BlinkThread    blinkThread(&threadList);
 static CounterThread  counterThread(&threadList);
@@ -152,8 +152,8 @@ void setup() {
     while (!Serial) {} // Pico USB-CDC: wait for host to open the port
 
     Serial.println("=== Paralax — Pi Pico Blink + Mailbox ===");
-    Serial.print("Stack per thread: ");
-    Serial.print((unsigned long)Thread::STACK_SIZE);
+    Serial.print("Default stack size: ");
+    Serial.print((unsigned long)PARALAX_STACK_SIZE);
     Serial.println(" bytes");
 
     printThreadList();

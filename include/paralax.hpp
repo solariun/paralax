@@ -30,9 +30,9 @@
 #define STACK_WATERMARK 0xCC
 
 /**
- * @brief Default per-thread stack size in bytes.
+ * @brief Default stack size when none is specified (bytes).
  *
- * Override before including this header for constrained targets:
+ * Override before including this header:
  * @code
  * #define PARALAX_STACK_SIZE 256  // AVR
  * #include "paralax.hpp"
@@ -44,61 +44,32 @@
 
 /* ---------------------------------------------------------------
  * User-provided time functions (must be defined in user code).
- *
- * Examples:
- *   Desktop:
- *     size_t paralax_getTime() { ... clock_gettime ... }
- *     void   paralax_sleepTime(size_t ms) { usleep(ms*1000); }
- *
- *   Arduino:
- *     size_t paralax_getTime() { return millis(); }
- *     void   paralax_sleepTime(size_t ms) { delay(ms); }
  * --------------------------------------------------------------- */
 
-/**
- * @brief Return the current time in user-defined units.
- * @return Current timestamp.
- */
+/// @brief Return the current time in user-defined units.
 extern size_t paralax_getTime();
 
-/**
- * @brief Sleep for the given duration in the same units as paralax_getTime().
- * @param time Duration to sleep.
- */
+/// @brief Sleep for the given duration in the same units as paralax_getTime().
 extern void paralax_sleepTime(size_t time);
 
 /* =============================================================== */
 
-class LinkList; ///< Forward declaration.
+class LinkList;
 
 /**
  * @class Linkable
  * @brief Intrusive doubly-linked list node.
- *
- * Any class that participates in a LinkList inherits from Linkable.
- * Auto-inserts on construction, auto-removes on destruction.
  */
 class Linkable {
 public:
-	Linkable	*next;      ///< Next node in the list.
-	Linkable	*prev;      ///< Previous node in the list.
-	LinkList	*container; ///< Owning list, or nullptr.
+	Linkable	*next;
+	Linkable	*prev;
+	LinkList	*container;
 
 	Linkable() = delete;
-
-	/**
-	 * @brief Construct and optionally insert into a list.
-	 * @param c List to insert into (nullptr to leave unlinked).
-	 */
 	Linkable(LinkList *c);
-
-	/// @brief Destructor. Removes from the list if linked.
 	virtual ~Linkable();
 
-	/**
-	 * @brief Return this pointer as void* for derived-type casting.
-	 * @return Pointer to this object.
-	 */
 	void *get() { return (void *)this; }
 };
 
@@ -110,33 +81,17 @@ public:
  */
 class LinkList {
 public:
-	Linkable	*head; ///< First node.
-	Linkable	*tail; ///< Last node.
+	Linkable	*head;
+	Linkable	*tail;
 
 	LinkList() : head(nullptr), tail(nullptr) {}
 
-	/**
-	 * @brief Append a node at the tail.
-	 * @param n Node to insert.
-	 */
 	void insert(Linkable *n);
-
-	/**
-	 * @brief Remove a node from the list.
-	 * @param n Node to remove.
-	 */
 	void remove(Linkable *n);
 
-	/// @brief Iterator to the first node.
 	Linkable *begin() const { return head; }
+	Linkable *end()   const { return nullptr; }
 
-	/// @brief Past-the-end sentinel (always nullptr).
-	Linkable *end() const { return nullptr; }
-
-	/**
-	 * @brief Insertion-sort the list.
-	 * @param cmp Returns true if @p a should come before @p b.
-	 */
 	void sort(bool (*cmp)(Linkable *, Linkable *));
 };
 
@@ -144,22 +99,27 @@ public:
 
 /**
  * @class Thread
- * @brief Cooperative thread with per-thread stack and time-based scheduling.
+ * @brief Cooperative thread with time-based scheduling.
  *
- * @par Scheduling order (highest to lowest urgency):
- * 1. **LATE** — next_run < now. Most overdue first.
- * 2. **NOW**  — just notified via wait/notify.
- * 3. **On-time** — next_run >= now. Earliest first.
- * 4. **WAITING** — blocked on wait(), skipped.
- * 5. **FINISHED** — done, skipped.
+ * Each thread needs a stack buffer. Two options:
  *
- * Within any tier, lower priority value wins.
+ * **1. Framework-allocated** (heap via new[]):
+ * @code
+ * MyThread t(&list, 4096);         // 4096-byte stack, allocated internally
+ * MyThread t(&list);               // uses PARALAX_STACK_SIZE default
+ * @endcode
+ *
+ * **2. User-provided** (static, heap, or any memory region):
+ * @code
+ * uint8_t buf[1024];
+ * MyThread t(&list, buf, sizeof(buf));  // uses your buffer, no allocation
+ * @endcode
+ *
+ * The framework frees internally-allocated stacks on destruction.
+ * User-provided buffers are never freed by the framework.
  */
 class Thread : public Linkable {
 public:
-	/// Per-thread stack size in bytes (configurable via PARALAX_STACK_SIZE).
-	static constexpr size_t STACK_SIZE = PARALAX_STACK_SIZE;
-
 	/// Guard zone at the bottom of the stack for overflow detection.
 	static constexpr size_t STACK_GUARD = 16;
 
@@ -186,9 +146,9 @@ private:
 	size_t		_wait_param;
 	size_t		_wait_value;
 
-	uint8_t		*_stack_ptr;   ///< Active stack buffer (internal or external).
-	size_t		_stack_size;   ///< Size of the active stack buffer.
-	uint8_t		_stack_buf[STACK_SIZE]; ///< Built-in stack (used when no external buffer).
+	uint8_t		*_stack_ptr;   ///< Active stack buffer.
+	size_t		_stack_size;   ///< Size of the active buffer.
+	bool		_owns_stack;   ///< True if we allocated _stack_ptr.
 
 	static jmp_buf sched_ret;
 	static Thread *volatile _init_target;
@@ -223,11 +183,6 @@ private:
 	}
 
 	void stack_paint();
-
-	/**
-	 * @brief Check if the stack guard zone is intact.
-	 * @return true if no overflow detected.
-	 */
 	bool stack_check() const;
 
 	__attribute__((noinline))
@@ -238,115 +193,75 @@ private:
 	static void   run_loop(LinkList *list);
 
 protected:
-	/**
-	 * @brief Thread entry point — implement in derived classes.
-	 *
-	 * Call yield() periodically to cooperate with other threads.
-	 */
+	/// @brief Thread entry point — implement in derived classes.
 	virtual void run() = 0;
 
-	/**
-	 * @brief Called when run() returns, before the thread is marked FINISHED.
-	 *
-	 * Override to release resources, close handles, or log the exit.
-	 * Default implementation does nothing.
-	 */
+	/// @brief Called when run() returns, before FINISHED. Override for cleanup.
 	virtual void finishing() {}
 
-	/**
-	 * @brief Called when a stack overflow is detected.
-	 *
-	 * The scheduler checks the guard zone (bottom STACK_GUARD bytes)
-	 * after each time slice. If corrupted, this callback is invoked
-	 * and the thread is forcibly marked FINISHED.
-	 *
-	 * Override to log, blink an LED, or dump diagnostics.
-	 * Default implementation does nothing.
-	 */
+	/// @brief Called on stack overflow detection. Thread is killed after this.
 	virtual void on_stack_overflow() {}
 
 public:
 	/**
-	 * @brief Construct a thread with built-in stack.
-	 * @param list  Thread pool list (nullptr to leave unlinked).
-	 * @param nice  Minimum interval between activations (time units). 0 = ASAP.
-	 * @param priority Tiebreaker: lower value = higher priority. Default 128.
+	 * @brief Construct with framework-allocated stack (heap).
+	 *
+	 * The stack is allocated via new[] and freed on destruction.
+	 *
+	 * @param list       Thread pool (nullptr to leave unlinked).
+	 * @param stack_size Stack size in bytes. Default PARALAX_STACK_SIZE.
+	 * @param nice       Min interval between activations. 0 = ASAP.
+	 * @param priority   Tiebreaker: lower = higher priority. Default 128.
 	 */
-	Thread(LinkList *list = nullptr, size_t nice = 0, uint8_t priority = 128);
+	Thread(LinkList *list = nullptr, size_t stack_size = PARALAX_STACK_SIZE,
+	       size_t nice = 0, uint8_t priority = 128);
 
 	/**
-	 * @brief Construct a thread with an external stack buffer.
+	 * @brief Construct with a user-provided stack buffer.
 	 *
-	 * Use this when the stack lives on the heap or in a custom memory region.
-	 * The caller owns the buffer and must keep it alive until the thread finishes.
+	 * The caller owns the buffer and must keep it alive until the thread
+	 * finishes. The framework will never free it.
 	 *
-	 * @param list      Thread pool list (nullptr to leave unlinked).
-	 * @param nice      Minimum interval between activations. 0 = ASAP.
-	 * @param priority  Tiebreaker: lower = higher priority. Default 128.
+	 * @param list      Thread pool (nullptr to leave unlinked).
 	 * @param ext_stack Pointer to the external stack buffer.
-	 * @param ext_size  Size of the external buffer in bytes.
+	 * @param ext_size  Size of the buffer in bytes.
+	 * @param nice      Min interval between activations. 0 = ASAP.
+	 * @param priority  Tiebreaker: lower = higher priority. Default 128.
 	 */
-	Thread(LinkList *list, size_t nice, uint8_t priority,
-	       uint8_t *ext_stack, size_t ext_size);
+	Thread(LinkList *list, uint8_t *ext_stack, size_t ext_size,
+	       size_t nice = 0, uint8_t priority = 128);
 
-	/// @brief Current state.
+	/**
+	 * @brief Destructor. Frees the stack if framework-allocated.
+	 */
+	virtual ~Thread();
+
+	/* --- accessors --- */
+
 	State       state()     const { return _state; }
-
-	/// @brief Minimum activation interval.
 	size_t      nice()      const { return _nice; }
-
-	/// @brief Priority (lower = higher).
 	uint8_t     priority()  const { return _priority; }
-
-	/// @brief Timestamp of next scheduled activation.
 	size_t      next_run()  const { return _next_run; }
-
-	/// @brief True if run() has returned.
 	bool        finished()  const { return _state == FINISHED; }
-
-	/// @brief Object address as an opaque ID.
 	const void *id()        const { return (const void *)this; }
-
-	/// @brief Total stack buffer size (internal or external).
 	size_t      stack_max() const { return _stack_size; }
 
-	/// @brief Pointer to the currently executing thread (or nullptr).
 	static Thread *running() { return _running; }
 
-	/**
-	 * @brief Human-readable state name.
-	 * @return One of "CREATED", "READY", "RUNNING", "YIELDED", "WAITING", "NOW", "FINISHED".
-	 */
+	/// @brief Human-readable state name.
 	const char *state_name() const;
 
-	/**
-	 * @brief Stack high-water mark — bytes used at peak.
-	 *
-	 * Scans the watermark pattern from the bottom of the stack.
-	 * @return Number of bytes that have been touched.
-	 */
+	/// @brief Stack high-water mark (bytes used at peak).
 	size_t stack_used() const;
 
-	/**
-	 * @brief Remaining stack bytes.
-	 * @return stack_max() - stack_used().
-	 */
+	/// @brief Remaining stack bytes.
 	size_t stack_free() const { return _stack_size - stack_used(); }
 
-	/**
-	 * @brief Voluntarily suspend this thread.
-	 *
-	 * Saves context and returns control to the scheduler.
-	 * Execution resumes here on the next time slice.
-	 */
+	/// @brief Voluntarily suspend this thread.
 	virtual void yield();
 
 	/**
 	 * @brief Suspend until notified on (key, param).
-	 *
-	 * The thread enters WAITING state and is skipped by the scheduler.
-	 * Another thread must call notify() with matching key and param.
-	 *
 	 * @param key   Endpoint identifier (pointer to any object).
 	 * @param param Operation discriminator.
 	 * @return The value passed by notify().
@@ -355,34 +270,17 @@ public:
 
 	/**
 	 * @brief Wake ONE thread waiting on (key, param).
-	 *
-	 * The woken thread enters NOW state for immediate dispatch.
-	 *
-	 * @param key   Endpoint to match.
-	 * @param param Operation to match.
-	 * @param value Value returned by the woken thread's wait().
 	 * @return true if a thread was woken.
 	 */
 	static bool notify(const void *key, size_t param, size_t value = 0);
 
 	/**
 	 * @brief Wake ALL threads waiting on (key, param).
-	 * @param key   Endpoint to match.
-	 * @param param Operation to match.
-	 * @param value Value returned by each woken thread's wait().
 	 * @return Number of threads woken.
 	 */
 	static size_t notify_all(const void *key, size_t param, size_t value = 0);
 
-	/**
-	 * @brief Initialize all threads and run them round-robin.
-	 *
-	 * For each thread: paints the stack, swaps SP, saves initial
-	 * context via bootstrap(), then returns. After all threads are
-	 * ready, enters the scheduler loop.
-	 *
-	 * @param list The thread pool to schedule.
-	 */
+	/// @brief Initialize all threads and run them round-robin.
 	static void schedule(LinkList *list);
 };
 
@@ -396,14 +294,8 @@ class Mutex {
 	bool _locked;
 public:
 	Mutex() : _locked(false) {}
-
-	/// @brief Acquire the lock. Blocks if already locked.
 	void lock();
-
-	/// @brief Release the lock. Wakes one waiter.
 	void unlock();
-
-	/// @brief True if currently locked.
 	bool locked() const { return _locked; }
 };
 
@@ -417,26 +309,10 @@ class Semaphore {
 	size_t _count;
 	size_t _max;
 public:
-	/**
-	 * @brief Construct a semaphore.
-	 * @param initial Initial count.
-	 * @param max     Maximum count (default SIZE_MAX).
-	 */
 	explicit Semaphore(size_t initial = 0, size_t max = (size_t)-1);
-
-	/// @brief Decrement. Blocks if count is zero.
 	void acquire();
-
-	/**
-	 * @brief Try to decrement without blocking.
-	 * @return true if acquired, false if count was zero.
-	 */
 	bool try_acquire();
-
-	/// @brief Increment and wake one waiter.
 	void release();
-
-	/// @brief Current count.
 	size_t count() const { return _count; }
 };
 
@@ -451,23 +327,9 @@ class Mailbox {
 	bool	_full;
 public:
 	Mailbox() : _msg(0), _full(false) {}
-
-	/**
-	 * @brief Send a message. Blocks if the mailbox is full.
-	 * @param msg Value to send.
-	 */
 	void send(size_t msg);
-
-	/**
-	 * @brief Receive a message. Blocks if the mailbox is empty.
-	 * @return The received value.
-	 */
 	size_t recv();
-
-	/// @brief True if no message is stored.
 	bool empty() const { return !_full; }
-
-	/// @brief True if a message is stored.
 	bool full()  const { return _full; }
 };
 
@@ -476,8 +338,6 @@ public:
 /**
  * @class Queue
  * @brief Bounded FIFO with blocking push/pop.
- *
- * Backed by a caller-provided buffer (no heap allocation).
  */
 class Queue {
 	size_t	*_buf;
@@ -486,35 +346,12 @@ class Queue {
 	size_t	_tail;
 	size_t	_count;
 public:
-	/**
-	 * @brief Construct a queue.
-	 * @param buf      Pointer to a size_t array for storage.
-	 * @param capacity Number of elements the array can hold.
-	 */
 	Queue(size_t *buf, size_t capacity);
-
-	/**
-	 * @brief Push a value. Blocks if the queue is full.
-	 * @param val Value to enqueue.
-	 */
 	void push(size_t val);
-
-	/**
-	 * @brief Pop a value. Blocks if the queue is empty.
-	 * @return The dequeued value.
-	 */
 	size_t pop();
-
-	/// @brief Number of elements currently stored.
 	size_t count()    const { return _count; }
-
-	/// @brief Maximum capacity.
 	size_t capacity() const { return _cap; }
-
-	/// @brief True if empty.
 	bool   empty()    const { return _count == 0; }
-
-	/// @brief True if full.
 	bool   full()     const { return _count >= _cap; }
 };
 

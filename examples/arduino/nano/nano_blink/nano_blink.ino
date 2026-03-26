@@ -7,8 +7,9 @@
  *   1. LED toggle     — toggles LED_BUILTIN every 500 ms
  *   2. Serial counter — prints an incrementing counter every 1000 ms
  *
- * Stack  : 128 bytes per thread.
- *          With 2 threads that is 512 bytes of stack space plus the Thread
+ * Stack  : 128 bytes per thread, using static buffers (user-provided
+ *          constructor) to avoid heap allocation on AVR.
+ *          With 2 threads that is 256 bytes of stack space plus the Thread
  *          objects themselves.  The ATmega328P only has 2048 bytes of SRAM,
  *          so keep everything minimal.  Avoid String objects and large
  *          local arrays inside run().
@@ -45,11 +46,19 @@ struct CounterThread;
 static LinkList threadList;
 
 /* ------------------------------------------------------------------
+ * Static stack buffers — no heap allocation on AVR.
+ * Each thread gets its own PARALAX_STACK_SIZE (128) byte buffer.
+ * ------------------------------------------------------------------ */
+static uint8_t blinkStack[PARALAX_STACK_SIZE];
+static uint8_t counterStack[PARALAX_STACK_SIZE];
+
+/* ------------------------------------------------------------------
  * Thread: LED toggle (500 ms nice)
+ * Uses the user-provided (external) stack constructor to avoid heap.
  * ------------------------------------------------------------------ */
 struct BlinkThread : public Thread {
-    BlinkThread(LinkList *list)
-        : Thread(list, 500, 100) {}
+    BlinkThread(LinkList *list, uint8_t *stack, size_t stack_sz)
+        : Thread(list, stack, stack_sz, 500, 100) {}
 
     void run() override {
         pinMode(LED_BUILTIN, OUTPUT);
@@ -65,10 +74,11 @@ struct BlinkThread : public Thread {
 /* ------------------------------------------------------------------
  * Thread: Serial counter (1000 ms nice)
  * Keep local variables to the bare minimum on AVR.
+ * Uses the user-provided (external) stack constructor to avoid heap.
  * ------------------------------------------------------------------ */
 struct CounterThread : public Thread {
-    CounterThread(LinkList *list)
-        : Thread(list, 1000, 120) {}
+    CounterThread(LinkList *list, uint8_t *stack, size_t stack_sz)
+        : Thread(list, stack, stack_sz, 1000, 120) {}
 
     void run() override {
         unsigned long count = 0;
@@ -82,10 +92,10 @@ struct CounterThread : public Thread {
 };
 
 /* ------------------------------------------------------------------
- * Instances (file-scope, allocated in .bss — no heap)
+ * Instances (file-scope, no heap — stacks are static buffers)
  * ------------------------------------------------------------------ */
-static BlinkThread   blinkThread(&threadList);
-static CounterThread counterThread(&threadList);
+static BlinkThread   blinkThread(&threadList, blinkStack, sizeof(blinkStack));
+static CounterThread counterThread(&threadList, counterStack, sizeof(counterStack));
 
 /* ------------------------------------------------------------------
  * Helper: print the thread list
@@ -116,7 +126,7 @@ void setup() {
 
     Serial.println(F("=== Paralax — Nano Blink ==="));
     Serial.print(F("Stack/thread: "));
-    Serial.print((unsigned long)Thread::STACK_SIZE);
+    Serial.print((unsigned long)PARALAX_STACK_SIZE);
     Serial.println(F(" B"));
 
     printThreadList();

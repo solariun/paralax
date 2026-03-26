@@ -105,22 +105,29 @@ size_t Thread::_sort_now;
  * Thread — constructor
  * ================================================================= */
 
-/* Internal stack constructor — uses the built-in _stack_buf[] */
-Thread::Thread(LinkList *list, size_t nice, uint8_t priority)
+/* Framework-allocated stack — heap via new[] */
+Thread::Thread(LinkList *list, size_t stack_size, size_t nice, uint8_t priority)
 	: Linkable(list), _state(CREATED), _priority(priority),
 	  _nice(nice), _next_run(0),
 	  _wait_key(nullptr), _wait_param(0), _wait_value(0),
-	  _stack_ptr(_stack_buf), _stack_size(STACK_SIZE)
+	  _stack_ptr(new uint8_t[stack_size]),
+	  _stack_size(stack_size), _owns_stack(true)
 {}
 
-/* External stack constructor — uses a caller-provided buffer */
-Thread::Thread(LinkList *list, size_t nice, uint8_t priority,
-               uint8_t *ext_stack, size_t ext_size)
+/* User-provided external stack — never freed by the framework */
+Thread::Thread(LinkList *list, uint8_t *ext_stack, size_t ext_size,
+               size_t nice, uint8_t priority)
 	: Linkable(list), _state(CREATED), _priority(priority),
 	  _nice(nice), _next_run(0),
 	  _wait_key(nullptr), _wait_param(0), _wait_value(0),
-	  _stack_ptr(ext_stack), _stack_size(ext_size)
+	  _stack_ptr(ext_stack), _stack_size(ext_size), _owns_stack(false)
 {}
+
+Thread::~Thread()
+{
+	if (_owns_stack)
+		delete[] _stack_ptr;
+}
 
 /* =================================================================
  * Thread — stack watermark

@@ -254,7 +254,7 @@ static int nice_slow_count;
 struct NiceFastThread : Thread {
 	int limit;
 	NiceFastThread(LinkList *l, int lim)
-		: Thread(l, 0, 128), limit(lim) {}
+		: Thread(l, PARALAX_STACK_SIZE, 0, 128), limit(lim) {}
 	void run() override
 	{
 		for (int i = 0; i < limit; i++) {
@@ -267,7 +267,7 @@ struct NiceFastThread : Thread {
 struct NiceSlowThread : Thread {
 	int limit;
 	NiceSlowThread(LinkList *l, int lim)
-		: Thread(l, 50, 128), limit(lim) {}
+		: Thread(l, PARALAX_STACK_SIZE, 50, 128), limit(lim) {}
 	void run() override
 	{
 		for (int i = 0; i < limit; i++) {
@@ -583,7 +583,7 @@ static int heap_thread_ran;
 
 struct HeapStackThread : Thread {
 	HeapStackThread(LinkList *l, uint8_t *buf, size_t sz)
-		: Thread(l, 0, 128, buf, sz) {}
+		: Thread(l, buf, sz) {}
 	void run() override
 	{
 		heap_thread_ran = 1;
@@ -643,7 +643,7 @@ static int overflow_called;
 struct OverflowThread : Thread {
 	/* small external stack — will overflow into the padding below */
 	OverflowThread(LinkList *l, uint8_t *buf, size_t sz)
-		: Thread(l, 0, 128, buf, sz) {}
+		: Thread(l, buf, sz) {}
 	void run() override
 	{
 		/* use more stack than the buffer provides */

@@ -64,7 +64,7 @@ static volatile unsigned long sharedCounter = 0;
  * ------------------------------------------------------------------ */
 struct BlinkThread : public Thread {
     BlinkThread(LinkList *list)
-        : Thread(list, 500, 100) {}
+        : Thread(list, PARALAX_STACK_SIZE, 500, 100) {}
 
     void run() override {
         pinMode(LED_BUILTIN, OUTPUT);
@@ -82,7 +82,7 @@ struct BlinkThread : public Thread {
  * ------------------------------------------------------------------ */
 struct CounterThread : public Thread {
     CounterThread(LinkList *list)
-        : Thread(list, 1000, 120) {}
+        : Thread(list, PARALAX_STACK_SIZE, 1000, 120) {}
 
     void run() override {
         unsigned long count = 0;
@@ -104,7 +104,7 @@ struct WorkerThread : public Thread {
     const char *name;
 
     WorkerThread(LinkList *list, const char *n, uint8_t prio)
-        : Thread(list, 300, prio), name(n) {}
+        : Thread(list, PARALAX_STACK_SIZE, 300, prio), name(n) {}
 
     void run() override {
         while (true) {
@@ -128,7 +128,7 @@ struct WorkerThread : public Thread {
 };
 
 /* ------------------------------------------------------------------
- * Instances (file-scope, allocated in .bss — no heap)
+ * Instances (file-scope; stacks are heap-allocated by the framework)
  * ------------------------------------------------------------------ */
 static BlinkThread   blinkThread(&threadList);
 static CounterThread counterThread(&threadList);
@@ -166,8 +166,8 @@ void setup() {
     delay(500);
 
     Serial.println("=== Paralax — ESP32 Multitask + Semaphore ===");
-    Serial.print("Stack per thread: ");
-    Serial.print((unsigned long)Thread::STACK_SIZE);
+    Serial.print("Default stack size: ");
+    Serial.print((unsigned long)PARALAX_STACK_SIZE);
     Serial.println(" bytes");
     Serial.println("NOTE: Paralax runs inside the Arduino loopTask (FreeRTOS).");
 

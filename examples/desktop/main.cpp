@@ -45,7 +45,7 @@ struct Worker : Thread {
 	int32_t steps;
 
 	Worker(const char *n, int32_t s, LinkList *l, size_t nice, uint8_t pri = 128)
-		: Thread(l, nice, pri), name(n), steps(s) {}
+		: Thread(l, PARALAX_STACK_SIZE, nice, pri), name(n), steps(s) {}
 
 	void run() override
 	{

@@ -64,7 +64,7 @@ static LinkList threadList;
  * ------------------------------------------------------------------ */
 struct BlinkThread : public Thread {
     BlinkThread(LinkList *list)
-        : Thread(list, 500, 100) {}
+        : Thread(list, PARALAX_STACK_SIZE, 500, 100) {}
 
     void run() override {
         pinMode(LED_BUILTIN, OUTPUT);
@@ -82,7 +82,7 @@ struct BlinkThread : public Thread {
  * ------------------------------------------------------------------ */
 struct CounterThread : public Thread {
     CounterThread(LinkList *list)
-        : Thread(list, 1000, 120) {}
+        : Thread(list, PARALAX_STACK_SIZE, 1000, 120) {}
 
     void run() override {
         unsigned long count = 0;
@@ -96,7 +96,7 @@ struct CounterThread : public Thread {
 };
 
 /* ------------------------------------------------------------------
- * Instances (file-scope, allocated in .bss — no heap)
+ * Instances (file-scope; stacks are heap-allocated by the framework)
  * ------------------------------------------------------------------ */
 static BlinkThread   blinkThread(&threadList);
 static CounterThread counterThread(&threadList);
@@ -132,8 +132,8 @@ void setup() {
 
     Serial.println();
     Serial.println("=== Paralax — ESP8266 Blink ===");
-    Serial.print("Stack per thread: ");
-    Serial.print((unsigned long)Thread::STACK_SIZE);
+    Serial.print("Default stack size: ");
+    Serial.print((unsigned long)PARALAX_STACK_SIZE);
     Serial.println(" bytes");
     Serial.println("WDT: delay() feeds the watchdog automatically.");
 
