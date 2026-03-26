@@ -33,7 +33,12 @@
  * @license MIT License. See LICENSE file for details.
  */
 
-#include "../../../include/paralax.hpp"   // adjust path as needed
+#include "paralax.hpp"
+
+/* ESP32 boards may not define LED_BUILTIN — GPIO 2 is common */
+#ifndef LED_BUILTIN
+#define LED_BUILTIN 2
+#endif
 
 /* ------------------------------------------------------------------
  * Time hooks required by Paralax

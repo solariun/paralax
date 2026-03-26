@@ -24,7 +24,7 @@
 /* Shrink the per-thread stack BEFORE including the framework header. */
 #define PARALAX_STACK_SIZE 128
 
-#include "../../../include/paralax.hpp"   // adjust path as needed
+#include "paralax.hpp"
 
 /* ------------------------------------------------------------------
  * Time hooks required by Paralax

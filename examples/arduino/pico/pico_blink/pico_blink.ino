@@ -20,7 +20,7 @@
  * @license MIT License. See LICENSE file for details.
  */
 
-#include "../../../include/paralax.hpp"   // adjust path as needed
+#include "paralax.hpp"
 
 /* ------------------------------------------------------------------
  * Time hooks required by Paralax
