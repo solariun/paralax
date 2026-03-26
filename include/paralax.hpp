@@ -160,6 +160,9 @@ public:
 	/// Per-thread stack size in bytes (configurable via PARALAX_STACK_SIZE).
 	static constexpr size_t STACK_SIZE = PARALAX_STACK_SIZE;
 
+	/// Guard zone at the bottom of the stack for overflow detection.
+	static constexpr size_t STACK_GUARD = 16;
+
 	/// Thread states.
 	enum State : uint8_t {
 		CREATED  = 0, ///< Constructed, not yet scheduled.
@@ -183,7 +186,9 @@ private:
 	size_t		_wait_param;
 	size_t		_wait_value;
 
-	uint8_t		stack[STACK_SIZE];
+	uint8_t		*_stack_ptr;   ///< Active stack buffer (internal or external).
+	size_t		_stack_size;   ///< Size of the active stack buffer.
+	uint8_t		_stack_buf[STACK_SIZE]; ///< Built-in stack (used when no external buffer).
 
 	static jmp_buf sched_ret;
 	static Thread *volatile _init_target;
@@ -219,6 +224,12 @@ private:
 
 	void stack_paint();
 
+	/**
+	 * @brief Check if the stack guard zone is intact.
+	 * @return true if no overflow detected.
+	 */
+	bool stack_check() const;
+
 	__attribute__((noinline))
 	static void bootstrap();
 
@@ -234,14 +245,49 @@ protected:
 	 */
 	virtual void run() = 0;
 
+	/**
+	 * @brief Called when run() returns, before the thread is marked FINISHED.
+	 *
+	 * Override to release resources, close handles, or log the exit.
+	 * Default implementation does nothing.
+	 */
+	virtual void finishing() {}
+
+	/**
+	 * @brief Called when a stack overflow is detected.
+	 *
+	 * The scheduler checks the guard zone (bottom STACK_GUARD bytes)
+	 * after each time slice. If corrupted, this callback is invoked
+	 * and the thread is forcibly marked FINISHED.
+	 *
+	 * Override to log, blink an LED, or dump diagnostics.
+	 * Default implementation does nothing.
+	 */
+	virtual void on_stack_overflow() {}
+
 public:
 	/**
-	 * @brief Construct a thread and optionally insert into a list.
+	 * @brief Construct a thread with built-in stack.
 	 * @param list  Thread pool list (nullptr to leave unlinked).
 	 * @param nice  Minimum interval between activations (time units). 0 = ASAP.
 	 * @param priority Tiebreaker: lower value = higher priority. Default 128.
 	 */
 	Thread(LinkList *list = nullptr, size_t nice = 0, uint8_t priority = 128);
+
+	/**
+	 * @brief Construct a thread with an external stack buffer.
+	 *
+	 * Use this when the stack lives on the heap or in a custom memory region.
+	 * The caller owns the buffer and must keep it alive until the thread finishes.
+	 *
+	 * @param list      Thread pool list (nullptr to leave unlinked).
+	 * @param nice      Minimum interval between activations. 0 = ASAP.
+	 * @param priority  Tiebreaker: lower = higher priority. Default 128.
+	 * @param ext_stack Pointer to the external stack buffer.
+	 * @param ext_size  Size of the external buffer in bytes.
+	 */
+	Thread(LinkList *list, size_t nice, uint8_t priority,
+	       uint8_t *ext_stack, size_t ext_size);
 
 	/// @brief Current state.
 	State       state()     const { return _state; }
@@ -261,8 +307,8 @@ public:
 	/// @brief Object address as an opaque ID.
 	const void *id()        const { return (const void *)this; }
 
-	/// @brief Total stack buffer size.
-	size_t      stack_max() const { return STACK_SIZE; }
+	/// @brief Total stack buffer size (internal or external).
+	size_t      stack_max() const { return _stack_size; }
 
 	/// @brief Pointer to the currently executing thread (or nullptr).
 	static Thread *running() { return _running; }
@@ -285,7 +331,7 @@ public:
 	 * @brief Remaining stack bytes.
 	 * @return stack_max() - stack_used().
 	 */
-	size_t stack_free() const { return STACK_SIZE - stack_used(); }
+	size_t stack_free() const { return _stack_size - stack_used(); }
 
 	/**
 	 * @brief Voluntarily suspend this thread.

@@ -576,6 +576,109 @@ TEST(stack_telemetry)
 }
 
 /* =================================================================
+ * Test: External heap stack
+ * ================================================================= */
+
+static int heap_thread_ran;
+
+struct HeapStackThread : Thread {
+	HeapStackThread(LinkList *l, uint8_t *buf, size_t sz)
+		: Thread(l, 0, 128, buf, sz) {}
+	void run() override
+	{
+		heap_thread_ran = 1;
+		volatile char local[64];
+		for (int i = 0; i < 64; i++) local[i] = (char)i;
+		(void)local[32];
+	}
+};
+
+TEST(external_heap_stack)
+{
+	heap_thread_ran = 0;
+	static uint8_t heap_buf[4096];
+	LinkList list;
+	HeapStackThread t(&list, heap_buf, sizeof(heap_buf));
+
+	ASSERT_EQ(t.stack_max(), (size_t)4096);
+
+	Thread::schedule(&list);
+
+	ASSERT_TRUE(t.finished());
+	ASSERT_EQ(heap_thread_ran, 1);
+	ASSERT_TRUE(t.stack_used() > 0);
+	ASSERT_TRUE(t.stack_used() < (size_t)4096);
+}
+
+/* =================================================================
+ * Test: finishing() callback
+ * ================================================================= */
+
+static int finishing_called;
+
+struct FinishingThread : Thread {
+	FinishingThread(LinkList *l) : Thread(l) {}
+	void run() override {}
+	void finishing() override { finishing_called = 1; }
+};
+
+TEST(finishing_callback)
+{
+	finishing_called = 0;
+	LinkList list;
+	FinishingThread t(&list);
+
+	Thread::schedule(&list);
+
+	ASSERT_TRUE(t.finished());
+	ASSERT_EQ(finishing_called, 1);
+}
+
+/* =================================================================
+ * Test: Stack overflow detection
+ * ================================================================= */
+
+static int overflow_called;
+
+struct OverflowThread : Thread {
+	/* small external stack — will overflow into the padding below */
+	OverflowThread(LinkList *l, uint8_t *buf, size_t sz)
+		: Thread(l, 0, 128, buf, sz) {}
+	void run() override
+	{
+		/* use more stack than the buffer provides */
+		volatile char bloat[1024];
+		for (int i = 0; i < 1024; i++) bloat[i] = (char)i;
+		(void)bloat[512];
+		yield();
+	}
+	void on_stack_overflow() override { overflow_called = 1; }
+};
+
+TEST(stack_overflow_detection)
+{
+	overflow_called = 0;
+
+	/* padded arena: overflow spills into pad[], not into test globals.
+	 * pad is at lower addresses (where the stack grows toward). */
+	/* 1024-byte bloat on a 512-byte stack → ~512 bytes overflow.
+	 * pad absorbs the overflow so it doesn't corrupt test globals. */
+	static struct {
+		uint8_t pad[1024];
+		uint8_t buf[512];
+	} arena;
+
+	LinkList list;
+	OverflowThread t(&list, arena.buf, sizeof(arena.buf));
+
+	Thread::schedule(&list);
+
+	/* thread should have been killed by overflow detection */
+	ASSERT_TRUE(t.finished());
+	ASSERT_EQ(overflow_called, 1);
+}
+
+/* =================================================================
  * Main — run all tests and report
  * ================================================================= */
 
@@ -611,6 +714,13 @@ int main()
 
 	/* Stack telemetry */
 	RUN_TEST(stack_telemetry);
+
+	/* External heap stack */
+	RUN_TEST(external_heap_stack);
+
+	/* Callbacks */
+	RUN_TEST(finishing_callback);
+	RUN_TEST(stack_overflow_detection);
 
 	/* Summary */
 	printf("\n===== Results: %d passed, %d failed =====\n",

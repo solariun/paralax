@@ -38,10 +38,15 @@ classDiagram
         -const void *_wait_key
         -size_t _wait_param
         -size_t _wait_value
-        -uint8_t stack[STACK_SIZE]
+        -uint8_t _stack_buf[STACK_SIZE]
+        -uint8_t *_stack_ptr
+        -size_t _stack_size
         +Thread(LinkList*, size_t nice, uint8_t priority)
+        +Thread(LinkList*, size_t nice, uint8_t priority, uint8_t *ext_stack, size_t ext_size)
         +run()* void
         +yield() void
+        +finishing() void
+        +on_stack_overflow() void
         +wait(key, param) size_t
         +notify(key, param, value)$ bool
         +notify_all(key, param, value)$ size_t
@@ -132,9 +137,23 @@ stateDiagram-v2
     WAITING --> NOW : notify(key, param, value)\n(another thread calls notify)
     NOW --> RUNNING : scheduler dispatches\n(immediate, no sleep)
 
-    RUNNING --> FINISHED : run() returns\n(longjmp caller)
+    RUNNING --> FINISHING : run() returns
+    FINISHING --> FINISHED : finishing() callback completes\n(longjmp caller)
+
+    RUNNING --> OVERFLOW : guard zone corrupted\n(bottom 16 bytes overwritten)
+    OVERFLOW --> FINISHED : on_stack_overflow() called\nthread forcibly killed
 
     FINISHED --> [*]
+
+    state FINISHING {
+        [*] --> finishing_cb : finishing() virtual callback
+        finishing_cb --> [*] : cleanup complete
+    }
+
+    state OVERFLOW {
+        [*] --> overflow_cb : on_stack_overflow() virtual callback
+        overflow_cb --> [*] : thread killed
+    }
 ```
 
 ---

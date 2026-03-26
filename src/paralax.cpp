@@ -105,10 +105,21 @@ size_t Thread::_sort_now;
  * Thread — constructor
  * ================================================================= */
 
+/* Internal stack constructor — uses the built-in _stack_buf[] */
 Thread::Thread(LinkList *list, size_t nice, uint8_t priority)
 	: Linkable(list), _state(CREATED), _priority(priority),
 	  _nice(nice), _next_run(0),
-	  _wait_key(nullptr), _wait_param(0), _wait_value(0)
+	  _wait_key(nullptr), _wait_param(0), _wait_value(0),
+	  _stack_ptr(_stack_buf), _stack_size(STACK_SIZE)
+{}
+
+/* External stack constructor — uses a caller-provided buffer */
+Thread::Thread(LinkList *list, size_t nice, uint8_t priority,
+               uint8_t *ext_stack, size_t ext_size)
+	: Linkable(list), _state(CREATED), _priority(priority),
+	  _nice(nice), _next_run(0),
+	  _wait_key(nullptr), _wait_param(0), _wait_value(0),
+	  _stack_ptr(ext_stack), _stack_size(ext_size)
 {}
 
 /* =================================================================
@@ -119,8 +130,24 @@ Thread::Thread(LinkList *list, size_t nice, uint8_t priority)
  * scanning from the bottom for intact bytes reveals the high-water mark. */
 void Thread::stack_paint()
 {
-	for (size_t i = 0; i < STACK_SIZE; i++)
-		stack[i] = STACK_WATERMARK;
+	for (size_t i = 0; i < _stack_size; i++)
+		_stack_ptr[i] = STACK_WATERMARK;
+}
+
+/* =================================================================
+ * Thread — stack overflow guard check
+ * ================================================================= */
+
+/* The bottom STACK_GUARD bytes of the stack buffer act as a canary.
+ * If any byte differs from STACK_WATERMARK, the stack grew past the
+ * buffer boundary — overflow. */
+bool Thread::stack_check() const
+{
+	for (size_t i = 0; i < STACK_GUARD && i < _stack_size; i++) {
+		if (_stack_ptr[i] != STACK_WATERMARK)
+			return false;
+	}
+	return true;
 }
 
 /* =================================================================
@@ -141,6 +168,7 @@ void Thread::bootstrap()
 	t->_state = RUNNING;
 	_running = t;
 	t->run();
+	t->finishing();
 	t->_state = FINISHED;
 	_running = nullptr;
 	longjmp(t->caller, 1);
@@ -230,6 +258,13 @@ void Thread::run_loop(LinkList *list)
 			next->_state = YIELDED;
 		_running = nullptr;
 
+		/* check stack guard zone for overflow */
+		if (!next->stack_check()) {
+			next->on_stack_overflow();
+			next->_state = FINISHED;
+			continue; /* skip next_run update, thread is dead */
+		}
+
 		/* schedule next activation */
 		next->_next_run = paralax_getTime() + next->_nice;
 	}
@@ -257,13 +292,13 @@ size_t Thread::stack_used() const
 {
 	/* count intact watermark bytes from the bottom (low address) up */
 	size_t clean = 0;
-	for (size_t i = 0; i < STACK_SIZE; i++) {
-		if (stack[i] == STACK_WATERMARK)
+	for (size_t i = 0; i < _stack_size; i++) {
+		if (_stack_ptr[i] == STACK_WATERMARK)
 			clean++;
 		else
 			break;
 	}
-	return STACK_SIZE - clean;
+	return _stack_size - clean;
 }
 
 void Thread::yield()
@@ -344,7 +379,7 @@ void Thread::schedule(LinkList *list)
 
 		_init_target = t;
 		if (setjmp(sched_ret) == 0) {
-			uintptr_t top = (uintptr_t)(t->stack + STACK_SIZE);
+			uintptr_t top = (uintptr_t)(t->_stack_ptr + t->_stack_size);
 			top = (top - 16) & ~(uintptr_t)0xF;
 			set_sp((void *)top);
 			bootstrap();

@@ -9,7 +9,7 @@ Paralax provides cooperative (non-preemptive) multithreading using only standard
 C++ and a single inline assembly instruction per architecture.  Key properties:
 
 - **No OS required** -- runs on bare-metal microcontrollers with no operating system.
-- **No heap allocation** -- all stacks are embedded inside the Thread object as fixed-size arrays.
+- **No heap allocation by default** -- all stacks are embedded inside the Thread object as fixed-size arrays, with optional support for external (heap or custom memory) stack buffers.
 - **No external dependencies** -- only `<setjmp.h>`, `<stdint.h>`, and `<stddef.h>`.
 - **One inline ASM instruction per architecture** -- `set_sp()` writes the stack pointer register; everything else is portable C++ (`setjmp`/`longjmp`).
 - **Time-based scheduling** with configurable `nice` (minimum interval) and `priority` (tiebreaker).
@@ -137,6 +137,8 @@ class Thread : public Linkable {
 public:
     // Construction
     Thread(LinkList *list = nullptr, size_t nice = 0, uint8_t priority = 128);
+    Thread(LinkList *list, size_t nice, uint8_t priority,
+           uint8_t *ext_stack, size_t ext_size);
 
     // States
     enum State : uint8_t {
@@ -151,7 +153,7 @@ public:
     size_t      next_run()   const;  // next scheduled activation time
     bool        finished()   const;  // true if run() returned
     const void *id()         const;  // opaque object address
-    size_t      stack_max()  const;  // PARALAX_STACK_SIZE
+    size_t      stack_max()  const;  // active stack size (internal or external)
     size_t      stack_used() const;  // high-water mark bytes used
     size_t      stack_free() const;  // stack_max() - stack_used()
 
@@ -160,6 +162,10 @@ public:
     // Cooperation
     virtual void run() = 0;          // implement in subclass
     virtual void yield();            // suspend, return to scheduler
+
+    // Lifecycle callbacks
+    virtual void finishing();        // called after run() returns, before FINISHED state
+    virtual void on_stack_overflow();// called when guard zone is corrupted; thread is killed
 
     // Wait / Notify IPC
     size_t wait(const void *key, size_t param);
@@ -171,10 +177,29 @@ public:
 };
 ```
 
-**Constructor parameters:**
+**Constructor parameters (default -- internal stack):**
 - `list` -- Thread pool to join. Pass `nullptr` and insert manually later.
 - `nice` -- Minimum time units between activations. `0` means run as fast as possible.
 - `priority` -- Lower value = scheduled first when other criteria are equal. Default `128`.
+
+**Constructor parameters (external stack):**
+- `list`, `nice`, `priority` -- Same as above.
+- `ext_stack` -- Pointer to a caller-supplied stack buffer (heap-allocated or from custom memory).
+- `ext_size` -- Size in bytes of the external stack buffer.
+
+When the external-stack constructor is used, the built-in `_stack_buf[STACK_SIZE]` is
+ignored and the thread operates entirely on the provided buffer. The caller is responsible
+for the lifetime of the external buffer (it must outlive the thread).
+
+**`finishing()`** -- Virtual callback invoked after `run()` returns but before
+the thread enters `FINISHED` state. Override to perform cleanup, logging, or
+resource release. The default implementation does nothing.
+
+**`on_stack_overflow()`** -- Virtual callback invoked when the scheduler detects
+that the guard zone (bottom 16 bytes of the stack buffer) has been corrupted.
+After this callback returns, the thread is forcibly killed (moved to `FINISHED`
+state). Override to log diagnostics or raise alerts. The default implementation
+does nothing.
 
 **`yield()`** -- Saves context via `setjmp`, returns to the scheduler via
 `longjmp`.  Execution resumes at the same point on the next time slice.
@@ -326,10 +351,155 @@ The scheduler exits its loop when either:
 There is no timeout or watchdog -- the scheduler simply returns from
 `schedule()`.
 
+## Wait/Notify — Zero Busy-Wait IPC
+
+The `wait`/`notify` pair is the foundation of all inter-thread communication
+in Paralax.  Unlike polling-based systems, **no CPU cycles are wasted** while a
+thread is waiting — the scheduler simply skips it.
+
+### Why it matters
+
+Most cooperative threading libraries rely on one of two patterns:
+
+1. **Polling** — the thread checks a flag every time it gets a time slice.
+   Wastes CPU, burns power, and the response latency equals the polling
+   interval.
+2. **Callback/event** — an external event loop dispatches handlers.  Works for
+   simple cases but doesn't give each handler its own stack or persistent
+   local state.
+
+Paralax takes a third approach: **endpoint-based blocking**.  A thread calls
+`wait(key, param)` and is immediately removed from the run queue.  It consumes
+zero cycles until another thread calls `notify(key, param, value)` with a
+matching endpoint.  At that point the waiting thread enters the `NOW` tier and
+is dispatched on the very next scheduler cycle — **no polling interval, no
+wasted ticks.**
+
+### How it works
+
+```
+wait(key, param)             notify(key, param, value)
+  |                             |
+  |  state = WAITING            |  scan thread list for match
+  |  setjmp(ctx)                |  set _wait_value = value
+  |  longjmp(caller) -------->  |  set state = NOW
+  |     (scheduler skips this   |  (scheduler dispatches it
+  |      thread entirely)       |   immediately on next cycle)
+  |                             |
+  |  <--- longjmp(ctx) -----   |
+  |  return value               |
+```
+
+The `key` is a `void *` — typically the address of the object that owns the
+resource (`this` of a Mutex, Queue, Mailbox, etc.).  The `param` is a `size_t`
+that distinguishes operations on the same endpoint (e.g., `0` = "waiting for
+data", `1` = "waiting for space").  The `value` is a `size_t` payload returned
+by `wait()`.
+
+### Building blocks
+
+Every synchronization primitive in Paralax is built entirely on `wait`/`notify`:
+
+| Primitive | wait key | param 0 | param 1 | value used? |
+|-----------|----------|---------|---------|-------------|
+| **Mutex** | `&mutex` | lock contention | — | No |
+| **Semaphore** | `&semaphore` | count == 0 | — | No |
+| **Mailbox** | `&mailbox` | waiting for message | waiting for space | Yes (the message) |
+| **Queue** | `&queue` | waiting for data | waiting for space | Yes (the item) |
+
+You can create your own primitives using the same pattern — any `while(condition)
+wait(this, N)` / `notify(this, N, value)` pair.
+
+### Message relay pattern
+
+Because `notify` carries a `size_t value`, it doubles as a lightweight
+message-passing channel.  A thread can relay **commands, status codes, sensor
+readings, or error flags** to another thread without any shared buffer:
+
+```cpp
+// Sensor thread
+void run() override {
+    for (;;) {
+        size_t reading = read_adc();
+        Thread::notify(&display_thread, 0, reading);
+        yield();
+    }
+}
+
+// Display thread
+void run() override {
+    for (;;) {
+        size_t reading = wait(&display_thread, 0);
+        update_lcd(reading);
+    }
+}
+```
+
+No queue, no buffer, no allocation — the value travels directly from the
+notifier to the waiter through the thread's `_wait_value` field.
+
+For richer data, use the value as an index into a shared array or as a pointer
+cast to `size_t`:
+
+```cpp
+// Send a command struct
+Command cmd = { CMD_MOVE, 100, 200 };
+commands[slot] = cmd;
+Thread::notify(motor_thread, 0, slot);
+
+// Receive
+size_t slot = wait(this, 0);
+Command cmd = commands[slot];
+```
+
+### Caveats and best practices
+
+**1. Notify is fire-and-forget.**
+If no thread is currently waiting on `(key, param)`, the notification is lost.
+This is by design — it keeps the mechanism stateless.  If you need guaranteed
+delivery, use a `Mailbox` or `Queue` (which internally loop on
+`while(condition) wait`).
+
+**2. Only one thread is woken per `notify()`.**
+If multiple threads wait on the same `(key, param)`, only the first one found
+in the list is woken.  Use `notify_all()` to wake all of them (useful for
+broadcast events like "config changed" or "shutdown").
+
+**3. Always wrap `wait` in a condition loop.**
+The standard pattern for all primitives is:
+
+```cpp
+while (!condition_met)
+    wait(key, param);
+// condition is now guaranteed
+```
+
+This handles spurious wakeups and races where another thread grabbed the
+resource between the notify and the resume.
+
+**4. Don't hold a Mutex across a `wait()` on a different key.**
+This can cause deadlocks: thread A holds mutex M and waits on key K, while
+thread B needs mutex M to notify on key K.  Keep critical sections short and
+avoid cross-key blocking.
+
+**5. `NOW` state has priority over on-time threads, but not over late threads.**
+A notified thread enters the `NOW` tier (tier 1), which runs before on-time
+threads (tier 2) but after late threads (tier 0).  This ensures time-critical
+threads that are already overdue are not starved by a burst of notifications.
+
+**6. Deadlock detection.**
+If all non-finished threads are in `WAITING` state, the scheduler exits.  This
+is the only deadlock protection — there is no timeout.  Design your thread
+interactions so that at least one thread can always make progress.
+
 ## Stack Configuration
 
-Each `Thread` object embeds a `uint8_t stack[PARALAX_STACK_SIZE]` array.
-Override the default before including the header:
+Each `Thread` object embeds a `uint8_t _stack_buf[PARALAX_STACK_SIZE]` array that
+is used by default. Internally, `_stack_ptr` and `_stack_size` track the active
+buffer -- they point to `_stack_buf` for the default constructor, or to the
+caller-supplied buffer when the external-stack constructor is used.
+
+Override the default built-in stack size before including the header:
 
 ```cpp
 #define PARALAX_STACK_SIZE 256
@@ -344,6 +514,30 @@ Override the default before including the header:
 | **ESP8266** | 1024 -- 2048 | 80 KB DRAM. WDT requires periodic `yield()` (see platform notes). |
 | **Pi Pico / ESP32** | 4096 -- 8192 | 264 KB (Pico) or 520 KB (ESP32) SRAM. Generous but not infinite. |
 | **Desktop** (x86-64, AArch64) | 8192+ | Default is 8192. Increase for deep call stacks or large locals. |
+
+### External / Heap Stacks
+
+If the built-in stack is too small (or you want per-thread sizing without
+recompiling), use the external-stack constructor to supply a heap-allocated or
+custom-memory buffer:
+
+```cpp
+uint8_t *heap_stack = new uint8_t[4096];
+MyThread t(&threads, 100, 128, heap_stack, 4096);
+```
+
+The thread will use `heap_stack` instead of its internal `_stack_buf[]`. Stack
+watermarking, `stack_used()`, `stack_free()`, and the guard-zone overflow check
+all work identically on external buffers. The caller owns the buffer and must
+ensure it remains valid for the lifetime of the thread (free it after the thread
+is `FINISHED`).
+
+You can also use statically allocated memory:
+
+```cpp
+static uint8_t big_stack[16384];
+MyThread t(&threads, 50, 128, big_stack, sizeof(big_stack));
+```
 
 ### Stack Watermarking
 
